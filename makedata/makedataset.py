@@ -10,11 +10,20 @@
 #   base_rain -> データセットに含める際の基準降水量
 
 import sqlite3
+import os
 from contextlib import closing
 import pickle
 import bz2
 import pandas as pd
-import datetime
+import numpy as np
+from datetime import datetime
+
+def TryPalse(txt):
+    try:
+        res = float(txt)
+        return True,res
+    except:
+        return False,None
 
 class makedataset:
     def __init__(self,dbname,Rt,Dt,rain_on_time = True,drainage_on_time = True,base_rain = 12):
@@ -28,7 +37,10 @@ class makedataset:
         self.dataset = []
         self.days = []
         self.reals = []
-    def ptoz(obj):
+        self.dataname = "datasets\dsr{0}d{1}.db".format(Rt,Dt)
+        self.tablename = 't_dsr{0}d{1}'.format(Rt,Dt)
+        print("Complete initialization of DataClass")
+    def ptoz(self,obj):
         PROTOCOL = pickle.HIGHEST_PROTOCOL
         return bz2.compress(pickle.dumps(obj, PROTOCOL), 3)
 
@@ -65,7 +77,7 @@ class makedataset:
 
             #ル―ル検証
             if(rule(month)):
-                time_t = datetime.datetime(year, month, day,hour = hour)
+                time_t = datetime(year, month, day,hour = hour)
                 if r_in:
                     res.append(o)
                     res.append(h)
@@ -89,44 +101,95 @@ class makedataset:
         c.execute("select Date,Year,Month,Day,Hour from " + data_table_name + " where _id = " + str(_id))
         fuga = c.fetchall()[0]
         _date,t_year,t_month,t_day,t_hour = fuga
-        time = datetime.datetime(t_year,t_month,t_day,t_hour)
-        real = inflow.at[_date, "0"]
+        time = datetime(t_year,t_month,t_day,t_hour)
+        real = inflow.at[_date, "inflow(mm)"]
         return (res, time,real,fail)
 
-    def __call__(self,rule,event_file_name,data_file_name,inflow_file):
+    def __call__(self,rule,event_file_name,data_file_name,inflow_file,end = False):
+        already_exist = False
+        conn_save = sqlite3.connect(self.dataname)
+        cur = conn_save.cursor()
+        select_sql = """SELECT COUNT(*) FROM sqlite_master 
+                    WHERE TYPE='table' AND name= '{0}' """.format(self.tablename)
+        cur.execute(select_sql)
+        if cur.fetchone()[0] != 0:
+            already_exist = True
+            print("Data is already exists")
 
-        with closing(sqlite3.connect(self.dbname)) as conn:
-            cur = conn.cursor()
-            select_sql = "select * from " + event_file_name
+        if not already_exist:
+            with closing(sqlite3.connect(self.dbname)) as conn:
+                cur = conn.cursor()
+                select_sql = "select * from " + event_file_name
+                cur.execute(select_sql)
+                for row in cur.fetchall():
+                    sd,ed,t,*hoge = row
+                    if t > self.br and ed != "":
+                        _select_sd = "select _id  from " + data_file_name + " where Date = " + "\'" + sd + "\'"
+                        _select_ed = "select _id  from " + data_file_name + " where Date = " + "\'" + ed + "\'"
+
+                        cur.execute(_select_sd)
+                        start_id,*hoge = cur.fetchall()[0]
+                        cur.execute(_select_ed)
+                        end_id, *hoge = cur.fetchall()[0]
+                        for i in range(start_id,end_id):
+                            res,day,real,fail = self.MakeOneData(_id = i,c= cur,data_table_name=data_file_name,rule = rule,inflow_file=inflow_file)
+                            isfloat, f_real = TryPalse(real)
+                            success = not fail
+                            inputcheck = not None in res
+                            if success and isfloat and inputcheck:
+                                self.dataset.append(res)
+                                self.days.append(day)
+                                self.reals.append(real)
+            if end:
+                savedata = []
+                for d in self.dataset:
+                    res = self.ptoz(d)
+                    savedata.append(res)
+                cur = conn_save.cursor()
+                create_sql = 'create table if not exists %s (_id integer primary key, _date text, _data blob, _real float)'% (self.tablename)
+                cur.execute(create_sql)
+                insert_sql = "insert into " + self.tablename + " (_date,_data,_real) values (?,?,?)"
+                for d1,d2,d3 in zip(self.days,savedata,self.reals):
+                    insert_objs = (d1,d2,d3)
+                    cur.execute(insert_sql,insert_objs)
+                conn_save.commit()
+                conn_save.close()
+        else:
+            cur = conn_save.cursor()
+            select_sql = "select * from " + self.tablename
             cur.execute(select_sql)
-            for row in cur.fetchall():
-                sd,ed,t,*hoge = row
-                if t > self.br and ed != "":
-                    _select_sd = "select _id  from " + data_file_name + " where Date = " + "\'" + sd + "\'"
-                    _select_ed = "select _id  from " + data_file_name + " where Date = " + "\'" + ed + "\'"
 
-                    cur.execute(_select_sd)
-                    start_id,*hoge = cur.fetchall()[0]
-                    cur.execute(_select_ed)
-                    end_id, *hoge = cur.fetchall()[0]
-                    for i in range(start_id,end_id):
-                        res,day,real,fail = self.MakeOneData(_id = i,c= cur,data_table_name=data_file_name,rule = rule,inflow_file=inflow_file)
-                        if not fail:
-                            self.dataset.append(res)
-                            self.days.append(day)
-                            self.reals.append(real)
+            for row in cur.fetchall():
+                ind,date,b,r = row
+                p = pickle.loads(bz2.decompress(b))
+                self.dataset.append(p)
+                self.days.append(date)
+                self.reals.append(r)
+
+        return already_exist
+
+
 
     def getdata(self,testyear):
         x_train = []
         x_test = []
         t_train = []
         t_test = []
+        testday = []
         for dt,dy,rl in zip(self.dataset,self.days,self.reals):
+            dy = datetime.strptime(dy, '%Y-%m-%d %H:%M:%S')
             year = dy.year
+
             if year == testyear:
                 x_test.append(dt)
-                t_test.append(rl)
+                t_test.append([rl])
+                testday.append(dy)
             else:
                 x_train.append(dt)
-                t_train.append(rl)
-        return x_train,t_train,x_test,t_test
+                t_train.append([rl])
+        x_train = np.array(x_train)
+        t_train = np.array(t_train)
+        x_test = np.array(x_test)
+        t_test = np.array(t_test)
+        print(testday)
+        return x_train,t_train,x_test,t_test,testday
